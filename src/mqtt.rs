@@ -24,12 +24,19 @@ enum PacketType
     Reserved
 }
 
+#[derive(Debug, PartialEq)]
+enum QoS
+{
+    AT_MOST_ONCE,
+    AT_LEAST_ONCE,
+    EXACTLY_ONCE
+}
+
 struct MqttHeader {
     packet_type: PacketType,
-    flag_0: bool,
-    flag_1: bool,
-    flag_2: bool,
-    flag_3: bool,
+    dup: bool,
+    qos: QoS,
+    retain: bool,
     remaining_bytes: u32,
     packet_identifier: Option<u16>
 }
@@ -62,15 +69,6 @@ fn read_packet_type(b: &u8) -> PacketType {
 
 fn read_header(bytes: Bytes) -> MqttHeader {
     panic!("Not implemented");
-    MqttHeader {
-        packet_type: PacketType::CONNACK,
-        flag_0: false,
-        flag_1: false,
-        flag_2: false,
-        flag_3: false,
-        remaining_bytes: 0,
-        packet_identifier: None
-    }
 }
 
 #[allow(unused_variables)]
