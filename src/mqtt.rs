@@ -184,7 +184,36 @@ fn read_header(bytes: &Bytes) -> FixedHeader {
 }
 
 fn read_var_header(header: &FixedHeader, bytes: &Bytes) -> (TypeHeader, usize) {
-    panic!("Not implemented")
+    match header.packet_type {
+        // CONNECT
+        PacketType::Connect => {
+            let proto_name_len = to_u16(bytes[0], bytes[1]);
+            let mut supported = false;
+            let mut flag_bits = 0u8;
+            let mut keep_alive = 0u16;
+            match proto_name_len {
+                4 => {
+                    // MQTT version 3.1.1
+                    supported = bytes[2] == 0x8D && bytes[3] == 0x91 && bytes[4] == 0x94
+                        && bytes[5] == 0x94 && bytes[6] == 0x04;
+                    if supported {
+                        flag_bits = bytes[7];
+                        keep_alive = to_u16(bytes[8], bytes[9]);
+                    }
+                }
+                _ => supported = false,
+            }
+            (
+                TypeHeader::Connect(ConnectHeader {
+                    supported: supported,
+                    flag_bits: flag_bits,
+                    keep_alive: keep_alive,
+                }),
+                10,
+            )
+        }
+        _ => (TypeHeader::None, 0),
+    }
 }
 
 pub fn read_packet(bytes: Bytes) -> MqttPacket {
@@ -205,6 +234,7 @@ mod tests {
     use std::collections::HashMap;
     use bytes::Bytes;
     use mqtt::*;
+    use mqtt::TypeHeader::*;
 
     #[test]
     fn reads_correct_packet_type() {
@@ -253,6 +283,7 @@ mod tests {
         );
     }
 
+    /* Common tests */
     #[test]
     fn reads_header_without_packet_id() {
         let connect_command = Bytes::from(vec![0x10, 0x25]);
@@ -275,5 +306,26 @@ mod tests {
         assert_eq!(header.dup, false);
         assert_eq!(header.qos, QoS::AtLeastOnce);
         assert_eq!(header.retain, false);
+    }
+
+    /* Type header tests */
+    #[test]
+    fn reads_connect_varheader() {
+        // CONNECT, MsgLen = 37, protocol name = MQTT, protocol level = 4,
+        // flags = 2, keep-alive: 5
+        let data = Bytes::from(vec![
+            0x10, 0x25, 0x00, 0x04, 0x8D, 0x91, 0x94, 0x94, 0x04, 0x02, 0x00, 0x05
+        ]);
+        let header = read_header(&data);
+        let fixed_offset = header.payload_offset;
+        let (var_header, var_offset) = read_var_header(&header, &data.slice_from(fixed_offset));
+        match var_header {
+            Connect(h) => {
+                assert_eq!(h.supported, true);
+                assert_eq!(h.flag_bits, 0x02);
+                assert_eq!(h.keep_alive, 5);
+            }
+            _ => assert_eq!(true, false),
+        }
     }
 }
