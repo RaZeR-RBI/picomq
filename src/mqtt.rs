@@ -39,6 +39,7 @@ struct MqttHeader {
     retain: bool,
     remaining_bytes: u32,
     packet_identifier: u16,
+    payload_offset: u8,
 }
 
 #[derive(Debug, PartialEq)]
@@ -72,50 +73,57 @@ fn to_u16(msb: u8, lsb: u8) -> u16 {
     lsb as u16 | (msb as u16) << 8
 }
 
-fn vlq(bytes: &Bytes) -> u32 {
+fn vlq(bytes: &Bytes) -> (u32, usize) {
     if bytes[0] < 128 {
-        return bytes[0] as u32;
+        return (bytes[0] as u32, 1);
     } else if bytes[1] < 128 {
-        return (bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7);
+        return ((bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7), 2);
     } else if bytes[2] < 128 {
-        return (bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7)
-            | ((bytes[2] as u32 & 127) << 14);
+        return (
+            (bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7)
+                | ((bytes[2] as u32 & 127) << 14),
+            3,
+        );
     } else {
-        return (bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7)
-            | ((bytes[2] as u32 & 127) << 14) | ((bytes[3] as u32 & 127) << 21);
+        return (
+            (bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7)
+                | ((bytes[2] as u32 & 127) << 14) | ((bytes[3] as u32 & 127) << 21),
+            4,
+        );
     }
 }
 
 fn read_header(bytes: Bytes) -> MqttHeader {
     let byte_1 = &bytes[0];
     let ptype = read_packet_type(byte_1);
-    let mut dup = false;
-    let mut qos = QoS::AT_MOST_ONCE;
-    let mut retain = false;
+    let mut payload_offset = 1u8;
 
-    let byte_2 = &bytes[1];
-    match ptype {
-        PacketType::PUBLISH => {
-            dup = (byte_2 & 0x08) == 8;
-            qos = match byte_2 & 0x06 {
-                0 => QoS::AT_MOST_ONCE,
-                1 => QoS::AT_LEAST_ONCE,
-                2 => QoS::EXACTLY_ONCE,
-                _ => QoS::RESERVED,
-            };
-            retain = (byte_2 & 0x01) == 1;
-        }
-        _ => {}
-    }
+    let dup = (byte_1 & 0x08) == 8;
+    let qos = match (byte_1 & 0x06) >> 1 {
+        0 => QoS::AT_MOST_ONCE,
+        1 => QoS::AT_LEAST_ONCE,
+        2 => QoS::EXACTLY_ONCE,
+        _ => QoS::RESERVED,
+    };
+    let retain = (byte_1 & 0x01) == 1;
+
+    let (remaining_bytes, offset) = vlq(&bytes.slice_from(1));
+    payload_offset += offset as u8;
 
     let packet_id = match ptype {
-        PacketType::PUBLISH if qos != QoS::AT_MOST_ONCE => to_u16(bytes[2], bytes[3]),
+        PacketType::PUBLISH if qos != QoS::AT_MOST_ONCE => {
+            payload_offset += 2;
+            to_u16(bytes[offset + 1], bytes[offset + 2])
+        }
         PacketType::CONNECT
         | PacketType::CONNACK
         | PacketType::PINGREQ
         | PacketType::PINGRESP
-        | PacketType::DISCONNECT => to_u16(bytes[2], bytes[3]),
-        _ => 1,
+        | PacketType::DISCONNECT => 0,
+        _ => {
+            payload_offset += 2;
+            to_u16(bytes[offset + 1], bytes[offset + 2])
+        }
     };
 
     MqttHeader {
@@ -123,8 +131,9 @@ fn read_header(bytes: Bytes) -> MqttHeader {
         dup: dup,
         qos: qos,
         retain: retain,
-        remaining_bytes: vlq(&bytes.slice_from(2)),
+        remaining_bytes: remaining_bytes,
         packet_identifier: packet_id,
+        payload_offset: payload_offset,
     }
 }
 
@@ -164,15 +173,47 @@ mod tests {
 
     #[test]
     fn reads_vlq() {
-        assert_eq!(vlq(&Bytes::from(vec![0])), 0);
-        assert_eq!(vlq(&Bytes::from(vec![0x40])), 64);
-        assert_eq!(vlq(&Bytes::from(vec![0x7F])), 127);
-        assert_eq!(vlq(&Bytes::from(vec![0x80, 0x01])), 128);
-        assert_eq!(vlq(&Bytes::from(vec![193, 2])), 321);
-        assert_eq!(vlq(&Bytes::from(vec![0xFF, 0x7F])), 16383);
-        assert_eq!(vlq(&Bytes::from(vec![0x80, 0x80, 0x01])), 16384);
-        assert_eq!(vlq(&Bytes::from(vec![0xFF, 0xFF, 0x7F])), 2097151);
-        assert_eq!(vlq(&Bytes::from(vec![0x80, 0x80, 0x80, 0x01])), 2097152);
-        assert_eq!(vlq(&Bytes::from(vec![0xFF, 0xFF, 0xFF, 0x7F])), 268435455);
+        assert_eq!(vlq(&Bytes::from(vec![0])), (0, 1));
+        assert_eq!(vlq(&Bytes::from(vec![0x40])), (64, 1));
+        assert_eq!(vlq(&Bytes::from(vec![0x7F])), (127, 1));
+        assert_eq!(vlq(&Bytes::from(vec![0x80, 0x01])), (128, 2));
+        assert_eq!(vlq(&Bytes::from(vec![193, 2])), (321, 2));
+        assert_eq!(vlq(&Bytes::from(vec![0xFF, 0x7F])), (16383, 2));
+        assert_eq!(vlq(&Bytes::from(vec![0x80, 0x80, 0x01])), (16384, 3));
+        assert_eq!(vlq(&Bytes::from(vec![0xFF, 0xFF, 0x7F])), (2097151, 3));
+        assert_eq!(
+            vlq(&Bytes::from(vec![0x80, 0x80, 0x80, 0x01])),
+            (2097152, 4)
+        );
+        assert_eq!(
+            vlq(&Bytes::from(vec![0xFF, 0xFF, 0xFF, 0x7F])),
+            (268435455, 4)
+        );
+    }
+
+    #[test]
+    fn reads_header_without_packet_id() {
+        let connect_command = Bytes::from(vec![0x10, 0x25]);
+        let header = read_header(connect_command);
+        assert_eq!(header.packet_type, PacketType::CONNECT);
+        assert_eq!(header.remaining_bytes, 37);
+
+        // reserved values
+        assert_eq!(header.dup, false);
+        assert_eq!(header.qos, QoS::AT_MOST_ONCE);
+        assert_eq!(header.retain, false);
+        assert_eq!(header.packet_identifier, 0); // not defined
+    }
+
+    #[test]
+    fn reads_header_with_qos_and_packet_id() {
+        let subscribe_command = Bytes::from(vec![0x82, 0x10, 0x00, 0x01]);
+        let header = read_header(subscribe_command);
+        assert_eq!(header.packet_type, PacketType::SUBSCRIBE);
+        assert_eq!(header.remaining_bytes, 16);
+        assert_eq!(header.dup, false);
+        assert_eq!(header.qos, QoS::AT_LEAST_ONCE);
+        assert_eq!(header.retain, false);
+        assert_eq!(header.packet_identifier, 1);
     }
 }
