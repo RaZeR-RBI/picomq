@@ -1,12 +1,11 @@
-extern crate tokio_proto;
-extern crate tokio_io;
 extern crate bytes;
+extern crate tokio_io;
+extern crate tokio_proto;
 
 use bytes::Bytes;
 
 #[derive(Debug, PartialEq)]
-enum PacketType
-{
+enum PacketType {
     CONNECT,
     CONNACK,
     PUBLISH,
@@ -21,29 +20,31 @@ enum PacketType
     PINGREQ,
     PINGRESP,
     DISCONNECT,
-    Reserved
+    RESERVED,
 }
 
 #[derive(Debug, PartialEq)]
-enum QoS
-{
+enum QoS {
     AT_MOST_ONCE,
     AT_LEAST_ONCE,
-    EXACTLY_ONCE
+    EXACTLY_ONCE,
+    RESERVED,
 }
 
+#[derive(Debug, PartialEq)]
 struct MqttHeader {
     packet_type: PacketType,
     dup: bool,
     qos: QoS,
     retain: bool,
     remaining_bytes: u32,
-    packet_identifier: Option<u16>
+    packet_identifier: u16,
 }
 
-struct MqttPacket<'a> {
+#[derive(Debug, PartialEq)]
+struct MqttPacket {
     header: MqttHeader,
-    payload: Option<&'a[u8]>
+    payload: Bytes,
 }
 
 fn read_packet_type(b: &u8) -> PacketType {
@@ -63,27 +64,81 @@ fn read_packet_type(b: &u8) -> PacketType {
         12 => PacketType::PINGREQ,
         13 => PacketType::PINGRESP,
         14 => PacketType::DISCONNECT,
-        _ => PacketType::Reserved
+        _ => PacketType::RESERVED,
+    }
+}
+
+fn to_u16(msb: u8, lsb: u8) -> u16 {
+    lsb as u16 | (msb as u16) << 8
+}
+
+fn vlq(bytes: &Bytes) -> u32 {
+    if bytes[0] < 128 {
+        return bytes[0] as u32;
+    } else if bytes[1] < 128 {
+        return (bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7);
+    } else if bytes[2] < 128 {
+        return (bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7)
+            | ((bytes[2] as u32 & 127) << 14);
+    } else {
+        return (bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7)
+            | ((bytes[2] as u32 & 127) << 14) | ((bytes[3] as u32 & 127) << 21);
     }
 }
 
 fn read_header(bytes: Bytes) -> MqttHeader {
-    panic!("Not implemented");
+    let byte_1 = &bytes[0];
+    let ptype = read_packet_type(byte_1);
+    let mut dup = false;
+    let mut qos = QoS::AT_MOST_ONCE;
+    let mut retain = false;
+
+    let byte_2 = &bytes[1];
+    match ptype {
+        PacketType::PUBLISH => {
+            dup = (byte_2 & 0x08) == 8;
+            qos = match byte_2 & 0x06 {
+                0 => QoS::AT_MOST_ONCE,
+                1 => QoS::AT_LEAST_ONCE,
+                2 => QoS::EXACTLY_ONCE,
+                _ => QoS::RESERVED,
+            };
+            retain = (byte_2 & 0x01) == 1;
+        }
+        _ => {}
+    }
+
+    let packet_id = match ptype {
+        PacketType::PUBLISH if qos != QoS::AT_MOST_ONCE => to_u16(bytes[2], bytes[3]),
+        PacketType::CONNECT
+        | PacketType::CONNACK
+        | PacketType::PINGREQ
+        | PacketType::PINGRESP
+        | PacketType::DISCONNECT => to_u16(bytes[2], bytes[3]),
+        _ => 1,
+    };
+
+    MqttHeader {
+        packet_type: ptype,
+        dup: dup,
+        qos: qos,
+        retain: retain,
+        remaining_bytes: vlq(&bytes.slice_from(2)),
+        packet_identifier: packet_id,
+    }
 }
 
 #[allow(unused_variables)]
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-
-    use mqtt::read_packet_type;
-    use mqtt::PacketType;
+    use bytes::Bytes;
+    use mqtt::*;
 
     #[test]
-    fn reads_correct_packet_type()
-    {
+    fn reads_correct_packet_type() {
         let type_map: HashMap<_, _> = vec![
-            (0x00, PacketType::Reserved),
+            (0x00, PacketType::RESERVED),
             (0x10, PacketType::CONNECT),
             (0x20, PacketType::CONNACK),
             (0x30, PacketType::PUBLISH),
@@ -98,11 +153,26 @@ mod tests {
             (0xC0, PacketType::PINGREQ),
             (0xD0, PacketType::PINGRESP),
             (0xE0, PacketType::DISCONNECT),
-            (0xF0, PacketType::Reserved)
-        ].into_iter().collect();
+            (0xF0, PacketType::RESERVED),
+        ].into_iter()
+            .collect();
 
         for (byte, ref ptype) in type_map.iter() {
             assert_eq!(read_packet_type(byte), **ptype);
         }
+    }
+
+    #[test]
+    fn reads_vlq() {
+        assert_eq!(vlq(&Bytes::from(vec![0])), 0);
+        assert_eq!(vlq(&Bytes::from(vec![0x40])), 64);
+        assert_eq!(vlq(&Bytes::from(vec![0x7F])), 127);
+        assert_eq!(vlq(&Bytes::from(vec![0x80, 0x01])), 128);
+        assert_eq!(vlq(&Bytes::from(vec![193, 2])), 321);
+        assert_eq!(vlq(&Bytes::from(vec![0xFF, 0x7F])), 16383);
+        assert_eq!(vlq(&Bytes::from(vec![0x80, 0x80, 0x01])), 16384);
+        assert_eq!(vlq(&Bytes::from(vec![0xFF, 0xFF, 0x7F])), 2097151);
+        assert_eq!(vlq(&Bytes::from(vec![0x80, 0x80, 0x80, 0x01])), 2097152);
+        assert_eq!(vlq(&Bytes::from(vec![0xFF, 0xFF, 0xFF, 0x7F])), 268435455);
     }
 }

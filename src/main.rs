@@ -7,5 +7,5 @@ extern crate bytes;
 mod mqtt;
 
 fn main() {
-    println!("Hello, world!");
+    panic!("Not implemented")
 }
