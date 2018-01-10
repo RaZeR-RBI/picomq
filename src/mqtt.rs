@@ -5,67 +5,131 @@ extern crate tokio_proto;
 use bytes::Bytes;
 
 #[derive(Debug, PartialEq)]
-enum PacketType {
-    CONNECT,
-    CONNACK,
-    PUBLISH,
-    PUBACK,
-    PUBREC,
-    PUBREL,
-    PUBCOMP,
-    SUBSCRIBE,
-    SUBACK,
-    UNSUBSCRIBE,
-    UNSUBACK,
-    PINGREQ,
-    PINGRESP,
-    DISCONNECT,
-    RESERVED,
+pub enum PacketType {
+    Connect,
+    ConnAck,
+    Publish,
+    PubAck,
+    PubRec,
+    PubRel,
+    PubComp,
+    Subscribe,
+    SubAck,
+    Unsubscribe,
+    UnsubAck,
+    PingReq,
+    PingResp,
+    Disconnect,
+    Reserved,
 }
 
 #[derive(Debug, PartialEq)]
-enum QoS {
-    AT_MOST_ONCE,
-    AT_LEAST_ONCE,
-    EXACTLY_ONCE,
-    RESERVED,
+pub enum QoS {
+    AtMostOnce,
+    AtLeastOnce,
+    ExactlyOnce,
+    Reserved,
 }
 
 #[derive(Debug, PartialEq)]
-struct MqttHeader {
+pub struct FixedHeader {
     packet_type: PacketType,
     dup: bool,
     qos: QoS,
     retain: bool,
     remaining_bytes: u32,
-    packet_identifier: u16,
     payload_offset: u8,
 }
 
 #[derive(Debug, PartialEq)]
-struct MqttPacket {
-    header: MqttHeader,
+pub struct MqttPacket {
+    header: FixedHeader,
+    var_header: TypeHeader,
     payload: Bytes,
+}
+
+/* Fixed-length headers for different packet types */
+#[derive(Debug, PartialEq)]
+pub enum TypeHeader {
+    None,
+    Connect(ConnectHeader),
+    ConnAck(ConnAckHeader),
+    PubAck(u16),
+    PubRec(u16),
+    PubRel(u16),
+    PubComp(u16),
+    Subscribe(u16),
+    SubAck(u16),
+    Unsubscribe(u16),
+    UnsubAck(u16),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ConnectHeader {
+    supported: bool, // checked by reading protocol name and level
+    flag_bits: u8,
+    keep_alive: u16,
+}
+
+impl ConnectHeader {
+    fn get_flag(&self, mask: u8) -> bool {
+        (self.flag_bits & mask) == mask
+    }
+    pub fn has_username_flag(&self) -> bool {
+        self.get_flag(0b10000000)
+    }
+    pub fn has_password_flag(&self) -> bool {
+        self.get_flag(0b01000000)
+    }
+    pub fn will_retain(&self) -> bool {
+        self.get_flag(0b00100000)
+    }
+    pub fn will_qos(&self) -> QoS {
+        match (self.flag_bits & 0b00011000) >> 3 {
+            0 => QoS::AtMostOnce,
+            1 => QoS::AtLeastOnce,
+            2 => QoS::ExactlyOnce,
+            _ => QoS::Reserved,
+        }
+    }
+    pub fn has_will_flag(&self) -> bool {
+        self.get_flag(0b00000100)
+    }
+    pub fn clean_session(&self) -> bool {
+        self.get_flag(0b00000010)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ConnAckHeader {
+    flags: u8,
+    return_code: u8,
+}
+
+impl ConnAckHeader {
+    pub fn session_present(&self) -> bool {
+        self.flags & 0x01 == 0x01
+    }
 }
 
 fn read_packet_type(b: &u8) -> PacketType {
     let value = (b & 0xF0) >> 4;
     match value {
-        1 => PacketType::CONNECT,
-        2 => PacketType::CONNACK,
-        3 => PacketType::PUBLISH,
-        4 => PacketType::PUBACK,
-        5 => PacketType::PUBREC,
-        6 => PacketType::PUBREL,
-        7 => PacketType::PUBCOMP,
-        8 => PacketType::SUBSCRIBE,
-        9 => PacketType::SUBACK,
-        10 => PacketType::UNSUBSCRIBE,
-        11 => PacketType::UNSUBACK,
-        12 => PacketType::PINGREQ,
-        13 => PacketType::PINGRESP,
-        14 => PacketType::DISCONNECT,
-        _ => PacketType::RESERVED,
+        1 => PacketType::Connect,
+        2 => PacketType::ConnAck,
+        3 => PacketType::Publish,
+        4 => PacketType::PubAck,
+        5 => PacketType::PubRec,
+        6 => PacketType::PubRel,
+        7 => PacketType::PubComp,
+        8 => PacketType::Subscribe,
+        9 => PacketType::SubAck,
+        10 => PacketType::Unsubscribe,
+        11 => PacketType::UnsubAck,
+        12 => PacketType::PingReq,
+        13 => PacketType::PingResp,
+        14 => PacketType::Disconnect,
+        _ => PacketType::Reserved,
     }
 }
 
@@ -93,46 +157,28 @@ fn vlq(bytes: &Bytes) -> (u32, usize) {
     }
 }
 
-fn read_header(bytes: Bytes) -> MqttHeader {
+fn read_header(bytes: Bytes) -> FixedHeader {
     let byte_1 = &bytes[0];
     let ptype = read_packet_type(byte_1);
     let mut payload_offset = 1u8;
 
     let dup = (byte_1 & 0x08) == 8;
     let qos = match (byte_1 & 0x06) >> 1 {
-        0 => QoS::AT_MOST_ONCE,
-        1 => QoS::AT_LEAST_ONCE,
-        2 => QoS::EXACTLY_ONCE,
-        _ => QoS::RESERVED,
+        0 => QoS::AtMostOnce,
+        1 => QoS::AtLeastOnce,
+        2 => QoS::ExactlyOnce,
+        _ => QoS::Reserved,
     };
     let retain = (byte_1 & 0x01) == 1;
 
     let (remaining_bytes, offset) = vlq(&bytes.slice_from(1));
     payload_offset += offset as u8;
-
-    let packet_id = match ptype {
-        PacketType::PUBLISH if qos != QoS::AT_MOST_ONCE => {
-            payload_offset += 2;
-            to_u16(bytes[offset + 1], bytes[offset + 2])
-        }
-        PacketType::CONNECT
-        | PacketType::CONNACK
-        | PacketType::PINGREQ
-        | PacketType::PINGRESP
-        | PacketType::DISCONNECT => 0,
-        _ => {
-            payload_offset += 2;
-            to_u16(bytes[offset + 1], bytes[offset + 2])
-        }
-    };
-
-    MqttHeader {
+    FixedHeader {
         packet_type: ptype,
         dup: dup,
         qos: qos,
         retain: retain,
         remaining_bytes: remaining_bytes,
-        packet_identifier: packet_id,
         payload_offset: payload_offset,
     }
 }
@@ -147,22 +193,22 @@ mod tests {
     #[test]
     fn reads_correct_packet_type() {
         let type_map: HashMap<_, _> = vec![
-            (0x00, PacketType::RESERVED),
-            (0x10, PacketType::CONNECT),
-            (0x20, PacketType::CONNACK),
-            (0x30, PacketType::PUBLISH),
-            (0x40, PacketType::PUBACK),
-            (0x50, PacketType::PUBREC),
-            (0x60, PacketType::PUBREL),
-            (0x70, PacketType::PUBCOMP),
-            (0x80, PacketType::SUBSCRIBE),
-            (0x90, PacketType::SUBACK),
-            (0xA0, PacketType::UNSUBSCRIBE),
-            (0xB0, PacketType::UNSUBACK),
-            (0xC0, PacketType::PINGREQ),
-            (0xD0, PacketType::PINGRESP),
-            (0xE0, PacketType::DISCONNECT),
-            (0xF0, PacketType::RESERVED),
+            (0x00, PacketType::Reserved),
+            (0x10, PacketType::Connect),
+            (0x20, PacketType::ConnAck),
+            (0x30, PacketType::Publish),
+            (0x40, PacketType::PubAck),
+            (0x50, PacketType::PubRec),
+            (0x60, PacketType::PubRel),
+            (0x70, PacketType::PubComp),
+            (0x80, PacketType::Subscribe),
+            (0x90, PacketType::SubAck),
+            (0xA0, PacketType::Unsubscribe),
+            (0xB0, PacketType::UnsubAck),
+            (0xC0, PacketType::PingReq),
+            (0xD0, PacketType::PingResp),
+            (0xE0, PacketType::Disconnect),
+            (0xF0, PacketType::Reserved),
         ].into_iter()
             .collect();
 
@@ -195,25 +241,23 @@ mod tests {
     fn reads_header_without_packet_id() {
         let connect_command = Bytes::from(vec![0x10, 0x25]);
         let header = read_header(connect_command);
-        assert_eq!(header.packet_type, PacketType::CONNECT);
+        assert_eq!(header.packet_type, PacketType::Connect);
         assert_eq!(header.remaining_bytes, 37);
 
-        // reserved values
+        // Reserved values
         assert_eq!(header.dup, false);
-        assert_eq!(header.qos, QoS::AT_MOST_ONCE);
+        assert_eq!(header.qos, QoS::AtMostOnce);
         assert_eq!(header.retain, false);
-        assert_eq!(header.packet_identifier, 0); // not defined
     }
 
     #[test]
     fn reads_header_with_qos_and_packet_id() {
         let subscribe_command = Bytes::from(vec![0x82, 0x10, 0x00, 0x01]);
         let header = read_header(subscribe_command);
-        assert_eq!(header.packet_type, PacketType::SUBSCRIBE);
+        assert_eq!(header.packet_type, PacketType::Subscribe);
         assert_eq!(header.remaining_bytes, 16);
         assert_eq!(header.dup, false);
-        assert_eq!(header.qos, QoS::AT_LEAST_ONCE);
+        assert_eq!(header.qos, QoS::AtLeastOnce);
         assert_eq!(header.retain, false);
-        assert_eq!(header.packet_identifier, 1);
     }
 }
