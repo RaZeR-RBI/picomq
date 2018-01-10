@@ -212,6 +212,14 @@ fn read_var_header(header: &FixedHeader, bytes: &Bytes) -> (TypeHeader, usize) {
                 10,
             )
         }
+        // CONNACK
+        PacketType::ConnAck => (
+            TypeHeader::ConnAck(ConnAckHeader {
+                flags: bytes[0],
+                return_code: bytes[1],
+            }),
+            2,
+        ),
         _ => (TypeHeader::None, 0),
     }
 }
@@ -323,7 +331,26 @@ mod tests {
             Connect(h) => {
                 assert_eq!(h.supported, true);
                 assert_eq!(h.flag_bits, 0x02);
+                assert_eq!(h.clean_session(), true);
                 assert_eq!(h.keep_alive, 5);
+            }
+            _ => assert_eq!(true, false),
+        }
+    }
+
+    #[test]
+    fn reads_connack_varheader() {
+        // CONNACK, no session present, connection accepted
+        let data = Bytes::from(vec![
+            0x20, 0x02, 0x00, 0x00
+        ]);
+        let header = read_header(&data);
+        let fixed_offset = header.payload_offset;
+        let (var_header, var_offset) = read_var_header(&header, &data.slice_from(fixed_offset));
+        match var_header {
+            ConnAck(h) => {
+                assert_eq!(h.session_present(), false);
+                assert_eq!(h.return_code, 0);
             }
             _ => assert_eq!(true, false),
         }
