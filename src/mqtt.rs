@@ -4,6 +4,7 @@ extern crate tokio_proto;
 
 use bytes::Bytes;
 use std::str::from_utf8;
+use std::collections::HashMap;
 
 #[derive(Debug, PartialEq)]
 pub enum PacketType {
@@ -165,6 +166,12 @@ impl ConnAckHeader {
     pub fn session_present(&self) -> bool {
         self.flags & 0x01 == 0x01
     }
+}
+
+/* SUBSCRIBE */
+pub struct SubscribePayload {
+    pub packet_id: u16,
+    pub filters: HashMap<String, QoS>,
 }
 
 /* Helper functions */
@@ -364,25 +371,58 @@ pub mod reader {
                         result.will_topic = Some(t);
                         result.will_message = Some(msg);
                     }
-                    _ => return Err("Will flag is defined, but no topic or message is found")
+                    _ => return Err("Will flag is defined, but no topic or message is found"),
                 }
             }
-            
+
             if head.has_username_flag() {
                 match utf8_safe_scan(&mut bytes) {
                     Some(u) => result.username = Some(u),
-                    _ => return Err("Username flag is defined, but no username is found")
+                    _ => return Err("Username flag is defined, but no username is found"),
                 }
             }
 
             if head.has_password_flag() {
                 match utf8_safe_scan(&mut bytes) {
                     Some(p) => result.password = Some(p),
-                    _ => return Err("Password flag is defined, but no password is found")
+                    _ => return Err("Password flag is defined, but no password is found"),
                 }
             }
 
             Ok(result)
+        }
+
+        pub fn get_subscribe_payload(self) -> Result<SubscribePayload, &'static str> {
+            if self.header.packet_type != PacketType::Subscribe {
+                panic!("Tried to read non-SUBSCRIBE packet as SUBSCRIBE type");
+            }
+            let packet_id = match self.var_header {
+                VariableHeader::Subscribe(h) => h,
+                _ => panic!("Found non-SUBSCRIBE varheader in SUBSCRIBE packet type"),
+            };
+            let mut bytes = self.payload.clone();
+            let mut filters = HashMap::<String, QoS>::new();
+            loop {
+                if bytes.len() < 2 {
+                    break;
+                }
+                match utf8_safe_scan(&mut bytes) {
+                    Some(filter) => {
+                        if bytes.len() == 0 {
+                            return Err("Unexpected end of stream");
+                        }
+                        let qos = QoS::from_byte(bytes[0], 0);
+                        bytes.advance(1);
+                        filters.insert(filter, qos);
+                    }
+                    None => return Err("Found invalid UTF-8 sequence"),
+                }
+            }
+
+            Ok(SubscribePayload {
+                packet_id: packet_id,
+                filters: filters,
+            })
         }
     }
 
@@ -498,8 +538,8 @@ pub mod reader {
                     assert_eq!(p.will_message, Option::None);
                     assert_eq!(p.username, Option::None);
                     assert_eq!(p.password, Option::None);
-                },
-                Err(r) => panic!(r)
+                }
+                Err(r) => panic!(r),
             }
         }
 
@@ -515,6 +555,32 @@ pub mod reader {
                     assert_eq!(h.return_code, ConnAckReturnCode::Accepted);
                 }
                 _ => panic!(),
+            }
+        }
+
+        #[test]
+        fn reads_subscribe_packet() {
+            // SUBSCRIBE, packet ID = 1, topic "SampleTopic", QoS = 0
+            let data = Bytes::from(vec![
+                0x82, 0x10, 0x00, 0x01, 0x00, 0x0b, 0x53, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x54, 0x6f,
+                0x70, 0x69, 0x63, 0x00,
+            ]);
+            let packet = read_packet(data);
+            let mut filters = HashMap::new();
+            filters.insert("SampleTopic".to_string(), QoS::AtMostOnce);
+
+            assert_eq!(packet.header.packet_type, PacketType::Subscribe);
+            match packet.var_header.clone() {
+                Subscribe(id) => assert_eq!(id, 1),
+                _ => panic!()
+            }
+            let payload = packet.get_subscribe_payload();
+            match payload {
+                Ok(p) => {
+                    assert_eq!(p.filters, filters);
+                    assert_eq!(p.packet_id, 1);
+                }
+                Err(r) => panic!(r)
             }
         }
 
