@@ -44,13 +44,13 @@ pub struct FixedHeader {
 #[derive(Debug, PartialEq)]
 pub struct MqttPacket {
     header: FixedHeader,
-    var_header: TypeHeader,
+    var_header: VariableHeader,
     payload: Bytes,
 }
 
 /* Fixed-length headers for different packet types */
 #[derive(Debug, PartialEq)]
-pub enum TypeHeader {
+pub enum VariableHeader {
     None,
     Connect(ConnectHeader),
     ConnAck(ConnAckHeader),
@@ -64,9 +64,11 @@ pub enum TypeHeader {
     UnsubAck(u16),
 }
 
+/* CONNECT */
 #[derive(Debug, PartialEq)]
 pub struct ConnectHeader {
-    supported: bool, // checked by reading protocol name and level
+    protocol_name: Bytes,
+    protocol_level: u8,
     flag_bits: u8,
     keep_alive: u16,
 }
@@ -100,10 +102,46 @@ impl ConnectHeader {
     }
 }
 
+/* CONNACK */
 #[derive(Debug, PartialEq)]
 pub struct ConnAckHeader {
     flags: u8,
-    return_code: u8,
+    return_code: ConnAckReturnCode,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ConnAckReturnCode {
+    Accepted,
+    UnacceptableProtocol,
+    IdentifierRejected,
+    ServerUnavailable,
+    BadAuth,
+    NotAuthorized,
+    Reserved,
+}
+
+impl ConnAckReturnCode {
+    pub fn from_byte(value: u8) -> ConnAckReturnCode {
+        match value {
+            0 => ConnAckReturnCode::Accepted,
+            1 => ConnAckReturnCode::UnacceptableProtocol,
+            2 => ConnAckReturnCode::IdentifierRejected,
+            3 => ConnAckReturnCode::ServerUnavailable,
+            4 => ConnAckReturnCode::NotAuthorized,
+            _ => ConnAckReturnCode::Reserved,
+        }
+    }
+
+    pub fn to_byte(self) -> u8 {
+        match self {
+            ConnAckReturnCode::Accepted => 0,
+            ConnAckReturnCode::UnacceptableProtocol => 1,
+            ConnAckReturnCode::IdentifierRejected => 2,
+            ConnAckReturnCode::ServerUnavailable => 3,
+            ConnAckReturnCode::NotAuthorized => 4,
+            _ => 255,
+        }
+    }
 }
 
 impl ConnAckHeader {
@@ -112,6 +150,7 @@ impl ConnAckHeader {
     }
 }
 
+/* Helper functions */
 fn read_packet_type(b: u8) -> PacketType {
     let value = (b & 0xF0) >> 4;
     match value {
@@ -160,7 +199,6 @@ fn vlq(bytes: &Bytes) -> (u32, usize) {
 fn read_header(bytes: &Bytes) -> FixedHeader {
     let byte_1 = bytes[0];
     let ptype = read_packet_type(byte_1);
-    let mut payload_offset = 1;
 
     let dup = (byte_1 & 0x08) == 8;
     let qos = match (byte_1 & 0x06) >> 1 {
@@ -172,55 +210,47 @@ fn read_header(bytes: &Bytes) -> FixedHeader {
     let retain = (byte_1 & 0x01) == 1;
 
     let (remaining_bytes, offset) = vlq(&bytes.slice_from(1));
-    payload_offset += offset;
     FixedHeader {
         packet_type: ptype,
         dup: dup,
         qos: qos,
         retain: retain,
         remaining_bytes: remaining_bytes,
-        payload_offset: payload_offset,
+        payload_offset: offset + 1,
     }
 }
 
-fn read_var_header(header: &FixedHeader, bytes: &Bytes) -> (TypeHeader, usize) {
+fn read_var_header(header: &FixedHeader, bytes: &Bytes) -> (VariableHeader, usize) {
     match header.packet_type {
         // CONNECT
         PacketType::Connect => {
-            let proto_name_len = to_u16(bytes[0], bytes[1]);
-            let mut supported = false;
-            let mut flag_bits = 0u8;
-            let mut keep_alive = 0u16;
-            match proto_name_len {
-                4 => {
-                    // MQTT version 3.1.1
-                    supported = bytes[2] == 0x8D && bytes[3] == 0x91 && bytes[4] == 0x94
-                        && bytes[5] == 0x94 && bytes[6] == 0x04;
-                    if supported {
-                        flag_bits = bytes[7];
-                        keep_alive = to_u16(bytes[8], bytes[9]);
-                    }
-                }
-                _ => supported = false,
-            }
+            let proto_name_len = to_u16(bytes[0], bytes[1]) as usize;
+            let protocol_name = bytes.slice(2, proto_name_len + 2);
+            let protocol_level = bytes[proto_name_len + 2];
+            let flag_bits = bytes[proto_name_len + 3];
+            let keep_alive = to_u16(
+                bytes[proto_name_len + 4],
+                bytes[proto_name_len + 5],
+            );
             (
-                TypeHeader::Connect(ConnectHeader {
-                    supported: supported,
+                VariableHeader::Connect(ConnectHeader {
+                    protocol_name: protocol_name,
+                    protocol_level: protocol_level,
                     flag_bits: flag_bits,
                     keep_alive: keep_alive,
                 }),
-                10,
+                proto_name_len + 6,
             )
         }
         // CONNACK
         PacketType::ConnAck => (
-            TypeHeader::ConnAck(ConnAckHeader {
+            VariableHeader::ConnAck(ConnAckHeader {
                 flags: bytes[0],
-                return_code: bytes[1],
+                return_code: ConnAckReturnCode::from_byte(bytes[1]),
             }),
             2,
         ),
-        _ => (TypeHeader::None, 0),
+        _ => (VariableHeader::None, 0),
     }
 }
 
@@ -242,7 +272,7 @@ mod tests {
     use std::collections::HashMap;
     use bytes::Bytes;
     use mqtt::*;
-    use mqtt::TypeHeader::*;
+    use mqtt::VariableHeader::*;
 
     #[test]
     fn reads_correct_packet_type() {
@@ -293,7 +323,7 @@ mod tests {
 
     /* Common tests */
     #[test]
-    fn reads_header_without_packet_id() {
+    fn reads_header_without_qos() {
         let connect_command = Bytes::from(vec![0x10, 0x25]);
         let header = read_header(&connect_command);
         assert_eq!(header.packet_type, PacketType::Connect);
@@ -306,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_header_with_qos_and_packet_id() {
+    fn reads_header_with_qos() {
         let subscribe_command = Bytes::from(vec![0x82, 0x10, 0x00, 0x01]);
         let header = read_header(&subscribe_command);
         assert_eq!(header.packet_type, PacketType::Subscribe);
@@ -316,43 +346,44 @@ mod tests {
         assert_eq!(header.retain, false);
     }
 
-    /* Type header tests */
+    /* Packet tests */
     #[test]
     fn reads_connect_varheader() {
         // CONNECT, MsgLen = 37, protocol name = MQTT, protocol level = 4,
-        // flags = 2, keep-alive: 5
+        // flags = 2, keep-alive: 5, client ID = "paho"
         let data = Bytes::from(vec![
-            0x10, 0x25, 0x00, 0x04, 0x8D, 0x91, 0x94, 0x94, 0x04, 0x02, 0x00, 0x05
+            0x10, 0x25, 0x00, 0x04, 0x8D, 0x91, 0x94, 0x94, 0x04, 0x02, 0x00, 0x05, 0x00, 0x04, 0x70, 0x61, 0x68, 0x6f
         ]);
-        let header = read_header(&data);
-        let fixed_offset = header.payload_offset;
-        let (var_header, var_offset) = read_var_header(&header, &data.slice_from(fixed_offset));
-        match var_header {
+        let protocol_name = data.slice(4, 8);
+        let payload = data.slice_from(12);
+        let packet = read_packet(data);
+        assert_eq!(packet.payload, &payload);
+        match packet.var_header {
             Connect(h) => {
-                assert_eq!(h.supported, true);
+                assert_eq!(protocol_name, &h.protocol_name);
+                assert_eq!(h.protocol_level, 0x04);
                 assert_eq!(h.flag_bits, 0x02);
                 assert_eq!(h.clean_session(), true);
                 assert_eq!(h.keep_alive, 5);
             }
-            _ => assert_eq!(true, false),
+            _ => panic!(),
         }
     }
 
     #[test]
     fn reads_connack_varheader() {
         // CONNACK, no session present, connection accepted
-        let data = Bytes::from(vec![
-            0x20, 0x02, 0x00, 0x00
-        ]);
-        let header = read_header(&data);
-        let fixed_offset = header.payload_offset;
-        let (var_header, var_offset) = read_var_header(&header, &data.slice_from(fixed_offset));
-        match var_header {
+        let data = Bytes::from(vec![0x20, 0x02, 0x00, 0x00]);
+        let packet = read_packet(data);
+        match packet.var_header {
             ConnAck(h) => {
                 assert_eq!(h.session_present(), false);
-                assert_eq!(h.return_code, 0);
+                assert_eq!(h.return_code, ConnAckReturnCode::Accepted);
             }
-            _ => assert_eq!(true, false),
+            _ => panic!(),
         }
     }
+
+    #[test]
+    fn reads_packet_identifier() {}
 }
