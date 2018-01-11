@@ -54,6 +54,7 @@ pub enum VariableHeader {
     None,
     Connect(ConnectHeader),
     ConnAck(ConnAckHeader),
+    Publish(PublishHeader),
     PubAck(u16),
     PubRec(u16),
     PubRel(u16),
@@ -62,6 +63,22 @@ pub enum VariableHeader {
     SubAck(u16),
     Unsubscribe(u16),
     UnsubAck(u16),
+}
+
+impl VariableHeader {
+    fn from_packet_id(ptype: PacketType, packet_id: u16) -> VariableHeader {
+        match ptype {
+            PacketType::PubAck => VariableHeader::PubAck(packet_id),
+            PacketType::PubRec => VariableHeader::PubRec(packet_id),
+            PacketType::PubRel => VariableHeader::PubRel(packet_id),
+            PacketType::PubComp => VariableHeader::PubComp(packet_id),
+            PacketType::Subscribe => VariableHeader::Subscribe(packet_id),
+            PacketType::SubAck => VariableHeader::SubAck(packet_id),
+            PacketType::Unsubscribe => VariableHeader::Unsubscribe(packet_id),
+            PacketType::UnsubAck => VariableHeader::UnsubAck(packet_id),
+            _ => VariableHeader::None
+        }
+    }
 }
 
 /* CONNECT */
@@ -172,6 +189,12 @@ fn read_packet_type(b: u8) -> PacketType {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub struct PublishHeader {
+    topic_name: Bytes,
+    packet_id: u16,
+}
+
 fn to_u16(msb: u8, lsb: u8) -> u16 {
     lsb as u16 | (msb as u16) << 8
 }
@@ -228,10 +251,7 @@ fn read_var_header(header: &FixedHeader, bytes: &Bytes) -> (VariableHeader, usiz
             let protocol_name = bytes.slice(2, proto_name_len + 2);
             let protocol_level = bytes[proto_name_len + 2];
             let flag_bits = bytes[proto_name_len + 3];
-            let keep_alive = to_u16(
-                bytes[proto_name_len + 4],
-                bytes[proto_name_len + 5],
-            );
+            let keep_alive = to_u16(bytes[proto_name_len + 4], bytes[proto_name_len + 5]);
             (
                 VariableHeader::Connect(ConnectHeader {
                     protocol_name: protocol_name,
@@ -250,6 +270,25 @@ fn read_var_header(header: &FixedHeader, bytes: &Bytes) -> (VariableHeader, usiz
             }),
             2,
         ),
+        // PUBLISH
+        PacketType::Publish => {
+            let topic_len = to_u16(bytes[0], bytes[1]) as usize;
+            let topic = bytes.slice(2, topic_len + 2);
+            let mut packet_id = 0u16;
+            let mut offset = topic_len + 2;
+            if header.qos != QoS::AtMostOnce {
+                packet_id = to_u16(bytes[offset], bytes[offset + 1]);
+                offset += 2;
+            }
+            (
+                VariableHeader::Publish(PublishHeader {
+                    topic_name: topic,
+                    packet_id: packet_id,
+                }),
+                offset,
+            )
+        },
+        
         _ => (VariableHeader::None, 0),
     }
 }
@@ -348,11 +387,12 @@ mod tests {
 
     /* Packet tests */
     #[test]
-    fn reads_connect_varheader() {
+    fn reads_connect_packet() {
         // CONNECT, MsgLen = 37, protocol name = MQTT, protocol level = 4,
         // flags = 2, keep-alive: 5, client ID = "paho"
         let data = Bytes::from(vec![
-            0x10, 0x25, 0x00, 0x04, 0x8D, 0x91, 0x94, 0x94, 0x04, 0x02, 0x00, 0x05, 0x00, 0x04, 0x70, 0x61, 0x68, 0x6f
+            0x10, 0x25, 0x00, 0x04, 0x8D, 0x91, 0x94, 0x94, 0x04, 0x02, 0x00, 0x05, 0x00, 0x04,
+            0x70, 0x61, 0x68, 0x6f,
         ]);
         let protocol_name = data.slice(4, 8);
         let payload = data.slice_from(12);
@@ -371,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_connack_varheader() {
+    fn reads_connack_packet() {
         // CONNACK, no session present, connection accepted
         let data = Bytes::from(vec![0x20, 0x02, 0x00, 0x00]);
         let packet = read_packet(data);
@@ -385,5 +425,39 @@ mod tests {
     }
 
     #[test]
-    fn reads_packet_identifier() {}
+    fn reads_publish_packet_with_packet_id() {
+        // PUBLISH, QoS = 1 (should have packet ID), topic: a/b, packet ID = 10, payload = Hello
+        let data = Bytes::from(vec![
+            0x33, 0x30, 0x00, 0x03, 0x61, 0x2F, 0x62, 0x00, 0xA, 0x48, 0x65, 0x6C, 0x6C, 0x6F
+        ]);
+        let topic = data.slice(4, 7);
+        let payload = data.slice_from(9);
+        let packet = read_packet(data);
+        match packet.var_header {
+            Publish(h) => {
+                assert_eq!(h.packet_id, 10);
+                assert_eq!(h.topic_name, &topic);
+            }
+            _ => panic!(),
+        }
+        assert_eq!(packet.payload, &payload);
+    }
+
+    #[test]
+    fn reads_publish_packet_without_packet_id() {
+        // PUBLISH, QoS = 0 (shouldn't have packet ID), topic: a/b, payload = Hello
+        let data = Bytes::from(vec![
+            0x31, 0x30, 0x00, 0x03, 0x61, 0x2F, 0x62, 0x48, 0x65, 0x6C, 0x6C, 0x6F
+        ]);
+        let topic = data.slice(4, 7);
+        let payload = data.slice_from(7);
+        let packet = read_packet(data);
+        match packet.var_header {
+            Publish(h) => {
+                assert_eq!(h.topic_name, &topic);
+            }
+            _ => panic!(),
+        }
+        assert_eq!(packet.payload, &payload);
+    }
 }
