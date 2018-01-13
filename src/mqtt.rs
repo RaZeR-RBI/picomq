@@ -25,7 +25,7 @@ pub enum PacketType {
     Reserved,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum QoS {
     AtMostOnce,
     AtLeastOnce,
@@ -157,7 +157,7 @@ impl ConnAckReturnCode {
             ConnAckReturnCode::IdentifierRejected => 2,
             ConnAckReturnCode::ServerUnavailable => 3,
             ConnAckReturnCode::NotAuthorized => 4,
-            _ => 255,
+            _ => panic!("Reserved return code should not be used"),
         }
     }
 }
@@ -168,10 +168,72 @@ impl ConnAckHeader {
     }
 }
 
+/* PUBLISH */
+#[derive(Debug, PartialEq, Clone)]
+pub struct PublishHeader {
+    pub topic_name: Bytes,
+    pub packet_id: u16,
+}
+
 /* SUBSCRIBE */
+#[derive(Debug, PartialEq)]
 pub struct SubscribePayload {
     pub packet_id: u16,
     pub filters: HashMap<String, QoS>,
+}
+
+impl Clone for SubscribePayload {
+    fn clone(&self) -> Self {
+        let packet_id = &self.packet_id;
+        let filters_to_copy = &self.filters;
+
+        let mut filters = HashMap::new();
+        for (key, val) in filters_to_copy.iter() {
+            filters.insert(key.clone().to_string(), val.clone());
+        }
+        SubscribePayload {
+            packet_id: *packet_id,
+            filters: filters
+        }
+    }
+}
+
+/* SUBACK */
+#[derive(Debug, PartialEq, Clone)]
+pub enum SubAckReturnCode {
+    MaximumQoS0,
+    MaximumQoS1,
+    MaximumQoS2,
+    Failure,
+    Reserved
+}
+
+impl SubAckReturnCode {
+    pub fn from_byte(value: u8) -> SubAckReturnCode {
+        match value {
+            0x00 => SubAckReturnCode::MaximumQoS0,
+            0x01 => SubAckReturnCode::MaximumQoS1,
+            0x02 => SubAckReturnCode::MaximumQoS2,
+            0x80 => SubAckReturnCode::Failure,
+            _ => SubAckReturnCode::Reserved
+        }
+    }
+
+    pub fn to_byte(self) -> u8 {
+        match self {
+          SubAckReturnCode::MaximumQoS0 => 0x00,
+          SubAckReturnCode::MaximumQoS1 => 0x01,
+          SubAckReturnCode::MaximumQoS2 => 0x02,
+          SubAckReturnCode::Failure => 0x80,
+          _ => panic!("Reserved return code should not be used")  
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct SubAckPayload {
+    packet_id: u16,
+    return_codes: Vec<SubAckReturnCode>,
 }
 
 /* Helper functions */
@@ -194,12 +256,6 @@ fn read_packet_type(b: u8) -> PacketType {
         14 => PacketType::Disconnect,
         _ => PacketType::Reserved,
     }
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct PublishHeader {
-    pub topic_name: Bytes,
-    pub packet_id: u16,
 }
 
 pub mod reader {
@@ -424,6 +480,28 @@ pub mod reader {
                 filters: filters,
             })
         }
+
+        pub fn get_suback_payload(self) -> Result<SubAckPayload, &'static str> {
+            if self.header.packet_type != PacketType::SubAck {
+                panic!("Tried to read non-SUBACK packet as SUBACK type");
+            }
+            let packet_id = match self.var_header {
+                VariableHeader::SubAck(h) => h,
+                _ => panic!("Found non-SUBACK varheader in SUBACK packet type"),
+            };
+            let bytes = self.payload;
+            if bytes.len() == 0 {
+                return Err("No result codes found in payload");
+            }
+            let mut return_codes = Vec::<SubAckReturnCode>::with_capacity(bytes.len());
+            for byte in bytes {
+                return_codes.push(SubAckReturnCode::from_byte(byte));
+            }
+            Ok(SubAckPayload {
+                packet_id: packet_id,
+                return_codes: return_codes
+            })
+        }
     }
 
     /* Tests */
@@ -511,10 +589,10 @@ pub mod reader {
         /* Packet tests */
         #[test]
         fn reads_connect_packet() {
-            // CONNECT, MsgLen = 37, protocol name = MQTT, protocol level = 4,
+            // CONNECT, MsgLen = 18, protocol name = MQTT, protocol level = 4,
             // flags = 2, keep-alive: 5, client ID = "paho"
             let data = Bytes::from(vec![
-                0x10, 0x25, 0x00, 0x04, 0x8D, 0x91, 0x94, 0x94, 0x04, 0x02, 0x00, 0x05, 0x00, 0x04,
+                0x10, 0x12, 0x00, 0x04, 0x8D, 0x91, 0x94, 0x94, 0x04, 0x02, 0x00, 0x05, 0x00, 0x04,
                 0x70, 0x61, 0x68, 0x6f,
             ]);
             let protocol_name = data.slice(4, 8);
@@ -581,6 +659,27 @@ pub mod reader {
                     assert_eq!(p.packet_id, 1);
                 }
                 Err(r) => panic!(r)
+            }
+        }
+
+        #[test]
+        fn reads_suback_payload() {
+            // SUBACK, packet ID 1, payload: QoS 0, QoS 2
+            let data = Bytes::from(vec![0x90, 0x04, 0x00, 0x01, 0x00, 0x02]);
+            let packet = read_packet(data);
+
+            assert_eq!(packet.header.packet_type, PacketType::SubAck);
+            match packet.var_header {
+                SubAck(packet_id) => assert_eq!(packet_id, 1),
+                _ => panic!(),
+            }
+            let payload = packet.get_suback_payload();
+            match payload {
+                Ok(p) => {
+                    assert_eq!(p.return_codes, vec![SubAckReturnCode::MaximumQoS0, SubAckReturnCode::MaximumQoS2]);
+                    assert_eq!(p.packet_id, 1);
+                },
+                _ => panic!()
             }
         }
 
