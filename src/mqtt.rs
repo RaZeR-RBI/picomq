@@ -235,28 +235,6 @@ pub struct UnsubscribePayload {
     filters: Vec<String>,
 }
 
-/* Helper functions */
-fn read_packet_type(b: u8) -> PacketType {
-    let value = (b & 0xF0) >> 4;
-    match value {
-        1 => PacketType::Connect,
-        2 => PacketType::ConnAck,
-        3 => PacketType::Publish,
-        4 => PacketType::PubAck,
-        5 => PacketType::PubRec,
-        6 => PacketType::PubRel,
-        7 => PacketType::PubComp,
-        8 => PacketType::Subscribe,
-        9 => PacketType::SubAck,
-        10 => PacketType::Unsubscribe,
-        11 => PacketType::UnsubAck,
-        12 => PacketType::PingReq,
-        13 => PacketType::PingResp,
-        14 => PacketType::Disconnect,
-        _ => PacketType::Reserved,
-    }
-}
-
 pub mod reader {
     use mqtt::*;
 
@@ -296,6 +274,7 @@ pub mod reader {
         if str_len + 2 > bytes.len() {
             return None;
         }
+        println!("{:?} - len = {}", bytes, str_len); 
         match from_utf8(&bytes.slice(2, str_len + 2)) {
             Ok(s) => Some(s.to_string()),
             Err(_) => None,
@@ -318,6 +297,28 @@ pub mod reader {
         }
     }
 
+    /* Helper functions */
+    fn read_packet_type(b: u8) -> PacketType {
+        let value = (b & 0xF0) >> 4;
+        match value {
+            1 => PacketType::Connect,
+            2 => PacketType::ConnAck,
+            3 => PacketType::Publish,
+            4 => PacketType::PubAck,
+            5 => PacketType::PubRec,
+            6 => PacketType::PubRel,
+            7 => PacketType::PubComp,
+            8 => PacketType::Subscribe,
+            9 => PacketType::SubAck,
+            10 => PacketType::Unsubscribe,
+            11 => PacketType::UnsubAck,
+            12 => PacketType::PingReq,
+            13 => PacketType::PingResp,
+            14 => PacketType::Disconnect,
+            _ => PacketType::Reserved,
+        }
+    }
+
     fn validate_header_flags(ptype: &PacketType, input: u8) -> bool {
         match *ptype {
             PacketType::Publish => true,
@@ -335,7 +336,7 @@ pub mod reader {
         if ptype == PacketType::Reserved {
             return Err("Invalid packet type");
         }
-        if !validate_header_flags(&ptype, bytes[1]) {
+        if !validate_header_flags(&ptype, byte_1 & 0x0F) {
             return Err("Invalid header flags");
         }
 
@@ -360,6 +361,7 @@ pub mod reader {
     }
 
     fn construct_packet(header: FixedHeader) -> Result<MqttPacket, &'static str> {
+        // TODO: Remove clone()
         let bytes = header.payload.clone();
         match header.packet_type {
             // CONNECT
@@ -367,6 +369,7 @@ pub mod reader {
                 if bytes.len() < 4 {
                     return Err("Not enough data supplied");
                 }
+                println!("{:?}", bytes);
                 if let Some(protocol_name) = utf8_safe_decode(&bytes, 0) {
                     let proto_name_len = protocol_name.len();
                     if bytes.len() < proto_name_len + 6 {
@@ -387,7 +390,7 @@ pub mod reader {
                         payload: bytes.slice_from(proto_name_len + 6),
                     });
                 }
-                Err("Invalid data supplied")
+                Err("Invalid UTF-8 sequence in protocol name")
             }
             // CONNACK
             PacketType::ConnAck => match bytes.len() {
@@ -681,15 +684,14 @@ pub mod reader {
             // CONNECT, MsgLen = 18, protocol name = MQTT, protocol level = 4,
             // flags = 2, keep-alive: 5, client ID = "paho"
             let data = Bytes::from(vec![
-                0x10, 0x12, 0x00, 0x04, 0x8D, 0x91, 0x94, 0x94, 0x04, 0x02, 0x00, 0x05, 0x00, 0x04,
+                0x10, 0x12, 0x00, 0x04, 0x4D, 0x51, 0x54, 0x54, 0x04, 0x02, 0x00, 0x05, 0x00, 0x04,
                 0x70, 0x61, 0x68, 0x6f,
             ]);
-            let protocol_name = data.slice(4, 8);
             let packet = read_packet(data).unwrap();
             assert_eq!(packet.header.packet_type, PacketType::Connect);
             match packet.var_header.clone() {
                 Connect(h) => {
-                    assert_eq!(protocol_name, &h.protocol_name);
+                    assert_eq!(h.protocol_name, "MQTT");
                     assert_eq!(h.protocol_level, 0x04);
                     assert_eq!(h.flag_bits, 0x02);
                     assert_eq!(h.clean_session(), true);
@@ -759,7 +761,7 @@ pub mod reader {
 
             assert_eq!(packet.header.packet_type, PacketType::SubAck);
             match packet.var_header {
-               WithPacketId(packet_id) => assert_eq!(packet_id, 1),
+                WithPacketId(packet_id) => assert_eq!(packet_id, 1),
                 _ => panic!(),
             }
             let payload = packet.get_suback_payload();
@@ -831,7 +833,7 @@ pub mod reader {
         fn reads_unsubscribe_packet() {
             // UNSUBSCRIBE, packet ID = 1, topic "SampleTopic"
             let data = Bytes::from(vec![
-                0xA0, 0x0F, 0x00, 0x01, 0x00, 0x0b, 0x53, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x54, 0x6f,
+                0xA2, 0x0F, 0x00, 0x01, 0x00, 0x0b, 0x53, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x54, 0x6f,
                 0x70, 0x69, 0x63,
             ]);
             let packet = read_packet(data).unwrap();
