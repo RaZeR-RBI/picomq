@@ -6,7 +6,7 @@ use bytes::Bytes;
 use std::str::from_utf8;
 use std::collections::HashMap;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum PacketType {
     Connect,
     ConnAck,
@@ -51,7 +51,7 @@ pub struct FixedHeader {
     pub qos: QoS,
     pub retain: bool,
     remaining_bytes: u32,
-    payload_offset: usize,
+    pub payload: Bytes,
 }
 
 #[derive(Debug, PartialEq)]
@@ -68,20 +68,13 @@ pub enum VariableHeader {
     Connect(ConnectHeader),
     ConnAck(ConnAckHeader),
     Publish(PublishHeader),
-    PubAck(u16),
-    PubRec(u16),
-    PubRel(u16),
-    PubComp(u16),
-    Subscribe(u16),
-    SubAck(u16),
-    Unsubscribe(u16),
-    UnsubAck(u16),
+    WithPacketId(u16),
 }
 
 /* CONNECT */
 #[derive(Debug, PartialEq, Clone)]
 pub struct ConnectHeader {
-    pub protocol_name: Bytes,
+    pub protocol_name: String,
     pub protocol_level: u8,
     flag_bits: u8,
     pub keep_alive: u16,
@@ -171,7 +164,7 @@ impl ConnAckHeader {
 /* PUBLISH */
 #[derive(Debug, PartialEq, Clone)]
 pub struct PublishHeader {
-    pub topic_name: Bytes,
+    pub topic_name: String,
     pub packet_id: u16,
 }
 
@@ -193,7 +186,7 @@ impl Clone for SubscribePayload {
         }
         SubscribePayload {
             packet_id: *packet_id,
-            filters: filters
+            filters: filters,
         }
     }
 }
@@ -205,7 +198,7 @@ pub enum SubAckReturnCode {
     MaximumQoS1,
     MaximumQoS2,
     Failure,
-    Reserved
+    Reserved,
 }
 
 impl SubAckReturnCode {
@@ -215,17 +208,17 @@ impl SubAckReturnCode {
             0x01 => SubAckReturnCode::MaximumQoS1,
             0x02 => SubAckReturnCode::MaximumQoS2,
             0x80 => SubAckReturnCode::Failure,
-            _ => SubAckReturnCode::Reserved
+            _ => SubAckReturnCode::Reserved,
         }
     }
 
     pub fn to_byte(self) -> u8 {
         match self {
-          SubAckReturnCode::MaximumQoS0 => 0x00,
-          SubAckReturnCode::MaximumQoS1 => 0x01,
-          SubAckReturnCode::MaximumQoS2 => 0x02,
-          SubAckReturnCode::Failure => 0x80,
-          _ => panic!("Reserved return code should not be used")  
+            SubAckReturnCode::MaximumQoS0 => 0x00,
+            SubAckReturnCode::MaximumQoS1 => 0x01,
+            SubAckReturnCode::MaximumQoS2 => 0x02,
+            SubAckReturnCode::Failure => 0x80,
+            _ => panic!("Reserved return code should not be used"),
         }
     }
 }
@@ -239,7 +232,7 @@ pub struct SubAckPayload {
 #[derive(Debug, PartialEq, Clone)]
 pub struct UnsubscribePayload {
     packet_id: u16,
-    filters: Vec<String>
+    filters: Vec<String>,
 }
 
 /* Helper functions */
@@ -292,9 +285,21 @@ pub mod reader {
         }
     }
 
-    fn utf8_decode(bytes: &Bytes, start: usize) -> Bytes {
-        let str_len = to_u16(bytes[start], bytes[start + 1]) as usize;
-        bytes.slice(start + 2, start + 2 + str_len)
+    fn utf8_safe_decode(bytes: &Bytes, start: usize) -> Option<String> {
+        if bytes.len() < 2 {
+            return None;
+        }
+        let str_len = to_u16(bytes[0], bytes[1]) as usize;
+        if str_len == 0 {
+            return Some(String::new());
+        }
+        if str_len + 2 > bytes.len() {
+            return None;
+        }
+        match from_utf8(&bytes.slice(2, str_len + 2)) {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => None,
+        }
     }
 
     fn utf8_safe_scan(bytes: &mut Bytes) -> Option<String> {
@@ -313,9 +318,26 @@ pub mod reader {
         }
     }
 
-    fn read_header(bytes: &Bytes) -> FixedHeader {
+    fn validate_header_flags(ptype: &PacketType, input: u8) -> bool {
+        match *ptype {
+            PacketType::Publish => true,
+            PacketType::PubRel | PacketType::Subscribe | PacketType::Unsubscribe => input == 0x02,
+            _ => input == 0x00,
+        }
+    }
+
+    fn read_header(bytes: &Bytes) -> Result<FixedHeader, &'static str> {
+        if bytes.len() < 2 {
+            return Err("Not enough bytes received");
+        }
         let byte_1 = bytes[0];
         let ptype = read_packet_type(byte_1);
+        if ptype == PacketType::Reserved {
+            return Err("Invalid packet type");
+        }
+        if !validate_header_flags(&ptype, bytes[1]) {
+            return Err("Invalid header flags");
+        }
 
         let dup = (byte_1 & 0x08) == 8;
         let qos = match (byte_1 & 0x06) >> 1 {
@@ -327,83 +349,112 @@ pub mod reader {
         let retain = (byte_1 & 0x01) == 1;
 
         let (remaining_bytes, offset) = vlq(&bytes.slice_from(1));
-        FixedHeader {
+        Ok(FixedHeader {
             packet_type: ptype,
             dup: dup,
             qos: qos,
             retain: retain,
             remaining_bytes: remaining_bytes,
-            payload_offset: offset + 1,
-        }
+            payload: bytes.slice_from(offset + 1),
+        })
     }
 
-    fn read_var_header(header: &FixedHeader, bytes: &Bytes) -> (VariableHeader, usize) {
+    fn construct_packet(header: FixedHeader) -> Result<MqttPacket, &'static str> {
+        let bytes = header.payload.clone();
         match header.packet_type {
             // CONNECT
             PacketType::Connect => {
-                let protocol_name = utf8_decode(bytes, 0);
-                let proto_name_len = protocol_name.len();
-                let protocol_level = bytes[proto_name_len + 2];
-                let flag_bits = bytes[proto_name_len + 3];
-                let keep_alive = to_u16(bytes[proto_name_len + 4], bytes[proto_name_len + 5]);
-                (
-                    VariableHeader::Connect(ConnectHeader {
+                if bytes.len() < 4 {
+                    return Err("Not enough data supplied");
+                }
+                if let Some(protocol_name) = utf8_safe_decode(&bytes, 0) {
+                    let proto_name_len = protocol_name.len();
+                    if bytes.len() < proto_name_len + 6 {
+                        return Err("Not enough data supplied");
+                    }
+                    let protocol_level = bytes[proto_name_len + 2];
+                    let flag_bits = bytes[proto_name_len + 3];
+                    let keep_alive = to_u16(bytes[proto_name_len + 4], bytes[proto_name_len + 5]);
+                    let var_header = VariableHeader::Connect(ConnectHeader {
                         protocol_name: protocol_name,
                         protocol_level: protocol_level,
                         flag_bits: flag_bits,
                         keep_alive: keep_alive,
-                    }),
-                    proto_name_len + 6,
-                )
+                    });
+                    return Ok(MqttPacket {
+                        header: header,
+                        var_header: var_header,
+                        payload: bytes.slice_from(proto_name_len + 6),
+                    });
+                }
+                Err("Invalid data supplied")
             }
             // CONNACK
-            PacketType::ConnAck => (
-                VariableHeader::ConnAck(ConnAckHeader {
-                    flags: bytes[0],
-                    return_code: ConnAckReturnCode::from_byte(bytes[1]),
-                }),
-                2,
-            ),
+            PacketType::ConnAck => match bytes.len() {
+                2 => {
+                    let var_header = VariableHeader::ConnAck(ConnAckHeader {
+                        flags: bytes[0],
+                        return_code: ConnAckReturnCode::from_byte(bytes[1]),
+                    });
+                    return Ok(MqttPacket {
+                        header: header,
+                        var_header: var_header,
+                        payload: Bytes::new(),
+                    });
+                }
+                _ => Err("Invalid data supplied"),
+            },
             // PUBLISH
             PacketType::Publish => {
-                let topic = utf8_decode(bytes, 0);
-                let topic_len = topic.len();
-                let mut packet_id = 0u16;
-                let mut offset = topic_len + 2;
-                if header.qos != QoS::AtMostOnce {
-                    packet_id = to_u16(bytes[offset], bytes[offset + 1]);
-                    offset += 2;
+                if (header.qos != QoS::AtMostOnce && bytes.len() < 6) || bytes.len() < 4 {
+                    return Err("Not enough data supplied");
                 }
-                (
-                    VariableHeader::Publish(PublishHeader {
-                        topic_name: topic,
-                        packet_id: packet_id,
-                    }),
-                    offset,
-                )
+                if let Some(topic) = utf8_safe_decode(&bytes, 0) {
+                    let topic_len = topic.len();
+                    let mut packet_id = 0u16;
+                    let mut offset = topic_len + 2;
+                    if header.qos != QoS::AtMostOnce {
+                        packet_id = to_u16(bytes[offset], bytes[offset + 1]);
+                        offset += 2;
+                    }
+                    return Ok(MqttPacket {
+                        header: header,
+                        var_header: VariableHeader::Publish(PublishHeader {
+                            topic_name: topic,
+                            packet_id: packet_id,
+                        }),
+                        payload: bytes.slice_from(offset),
+                    });
+                }
+                Err("Invalid UTF-8 sequence")
             }
-            PacketType::PubAck => (VariableHeader::PubAck(to_u16(bytes[0], bytes[1])), 2),
-            PacketType::PubRec => (VariableHeader::PubRec(to_u16(bytes[0], bytes[1])), 2),
-            PacketType::PubRel => (VariableHeader::PubRel(to_u16(bytes[0], bytes[1])), 2),
-            PacketType::PubComp => (VariableHeader::PubComp(to_u16(bytes[0], bytes[1])), 2),
-            PacketType::Subscribe => (VariableHeader::Subscribe(to_u16(bytes[0], bytes[1])), 2),
-            PacketType::SubAck => (VariableHeader::SubAck(to_u16(bytes[0], bytes[1])), 2),
-            PacketType::Unsubscribe => (VariableHeader::Unsubscribe(to_u16(bytes[0], bytes[1])), 2),
-            PacketType::UnsubAck => (VariableHeader::UnsubAck(to_u16(bytes[0], bytes[1])), 2),
-            _ => (VariableHeader::None, 0),
+            PacketType::PubAck
+            | PacketType::PubRec
+            | PacketType::PubRel
+            | PacketType::PubComp
+            | PacketType::Subscribe
+            | PacketType::SubAck
+            | PacketType::Unsubscribe
+            | PacketType::UnsubAck => {
+                if bytes.len() < 2 {
+                    return Err("Not enough data supplied");
+                }
+                Ok(MqttPacket {
+                    header: header,
+                    var_header: VariableHeader::WithPacketId(to_u16(bytes[0], bytes[1])),
+                    payload: bytes.slice_from(2),
+                })
+            }
+            _ => Ok(MqttPacket {
+                header: header,
+                var_header: VariableHeader::None,
+                payload: bytes,
+            }),
         }
     }
 
-    pub fn read_packet(bytes: Bytes) -> MqttPacket {
-        let header = read_header(&bytes);
-        let fixed_offset = header.payload_offset;
-        let (var_header, var_offset) = read_var_header(&header, &bytes.slice_from(fixed_offset));
-        let payload = bytes.slice_from(fixed_offset + var_offset);
-        MqttPacket {
-            header: header,
-            var_header: var_header,
-            payload: payload,
-        }
+    pub fn read_packet(bytes: Bytes) -> Result<MqttPacket, &'static str> {
+        read_header(&bytes).and_then(|h| construct_packet(h))
     }
 
     /* Packet-type related payload reading */
@@ -459,12 +510,12 @@ pub mod reader {
                 panic!("Tried to read non-SUBSCRIBE packet as SUBSCRIBE type");
             }
             let packet_id = match self.var_header {
-                VariableHeader::Subscribe(h) => h,
-                _ => panic!("Found non-SUBSCRIBE varheader in SUBSCRIBE packet type"),
+                VariableHeader::WithPacketId(h) => h,
+                _ => panic!("Found uncompatible varheader in SUBSCRIBE packet type"),
             };
             if self.payload.len() == 0 {
                 return Err("No payload found");
-            } 
+            }
             let mut bytes = self.payload.clone();
             let mut filters = HashMap::<String, QoS>::new();
             loop {
@@ -495,8 +546,8 @@ pub mod reader {
                 panic!("Tried to read non-SUBACK packet as SUBACK type");
             }
             let packet_id = match self.var_header {
-                VariableHeader::SubAck(h) => h,
-                _ => panic!("Found non-SUBACK varheader in SUBACK packet type"),
+                VariableHeader::WithPacketId(h) => h,
+                _ => panic!("Found incompatible varheader in SUBACK packet type"),
             };
             let bytes = self.payload;
             if bytes.len() == 0 {
@@ -508,7 +559,7 @@ pub mod reader {
             }
             Ok(SubAckPayload {
                 packet_id: packet_id,
-                return_codes: return_codes
+                return_codes: return_codes,
             })
         }
 
@@ -517,8 +568,8 @@ pub mod reader {
                 panic!("Tried to read non-UNSUBSCRIBE packet as UNSUBSCRIBE type");
             }
             let packet_id = match self.var_header {
-                VariableHeader::Unsubscribe(h) => h,
-                _ => panic!("Found non-UNSUBSCRIBE varheader in UNSUBSCRIBE packet type"),
+                VariableHeader::WithPacketId(h) => h,
+                _ => panic!("Found incompatible varheader in UNSUBSCRIBE packet type"),
             };
             if self.payload.len() == 0 {
                 return Err("No payload found");
@@ -603,7 +654,7 @@ pub mod reader {
         #[test]
         fn reads_header_without_qos() {
             let connect_command = Bytes::from(vec![0x10, 0x25]);
-            let header = read_header(&connect_command);
+            let header = read_header(&connect_command).unwrap();
             assert_eq!(header.packet_type, PacketType::Connect);
             assert_eq!(header.remaining_bytes, 37);
 
@@ -616,7 +667,7 @@ pub mod reader {
         #[test]
         fn reads_header_with_qos() {
             let subscribe_command = Bytes::from(vec![0x82, 0x10, 0x00, 0x01]);
-            let header = read_header(&subscribe_command);
+            let header = read_header(&subscribe_command).unwrap();
             assert_eq!(header.packet_type, PacketType::Subscribe);
             assert_eq!(header.remaining_bytes, 16);
             assert_eq!(header.dup, false);
@@ -634,7 +685,7 @@ pub mod reader {
                 0x70, 0x61, 0x68, 0x6f,
             ]);
             let protocol_name = data.slice(4, 8);
-            let packet = read_packet(data);
+            let packet = read_packet(data).unwrap();
             assert_eq!(packet.header.packet_type, PacketType::Connect);
             match packet.var_header.clone() {
                 Connect(h) => {
@@ -663,7 +714,7 @@ pub mod reader {
         fn reads_connack_packet() {
             // CONNACK, no session present, connection accepted
             let data = Bytes::from(vec![0x20, 0x02, 0x00, 0x00]);
-            let packet = read_packet(data);
+            let packet = read_packet(data).unwrap();
             assert_eq!(packet.header.packet_type, PacketType::ConnAck);
             match packet.var_header {
                 ConnAck(h) => {
@@ -681,14 +732,14 @@ pub mod reader {
                 0x82, 0x10, 0x00, 0x01, 0x00, 0x0b, 0x53, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x54, 0x6f,
                 0x70, 0x69, 0x63, 0x00,
             ]);
-            let packet = read_packet(data);
+            let packet = read_packet(data).unwrap();
             let mut filters = HashMap::new();
             filters.insert("SampleTopic".to_string(), QoS::AtMostOnce);
 
             assert_eq!(packet.header.packet_type, PacketType::Subscribe);
             match packet.var_header.clone() {
-                Subscribe(id) => assert_eq!(id, 1),
-                _ => panic!()
+                WithPacketId(id) => assert_eq!(id, 1),
+                _ => panic!(),
             }
             let payload = packet.get_subscribe_payload();
             match payload {
@@ -696,7 +747,7 @@ pub mod reader {
                     assert_eq!(p.filters, filters);
                     assert_eq!(p.packet_id, 1);
                 }
-                Err(r) => panic!(r)
+                Err(r) => panic!(r),
             }
         }
 
@@ -704,20 +755,23 @@ pub mod reader {
         fn reads_suback_packet() {
             // SUBACK, packet ID 1, payload: QoS 0, QoS 2
             let data = Bytes::from(vec![0x90, 0x04, 0x00, 0x01, 0x00, 0x02]);
-            let packet = read_packet(data);
+            let packet = read_packet(data).unwrap();
 
             assert_eq!(packet.header.packet_type, PacketType::SubAck);
             match packet.var_header {
-                SubAck(packet_id) => assert_eq!(packet_id, 1),
+               WithPacketId(packet_id) => assert_eq!(packet_id, 1),
                 _ => panic!(),
             }
             let payload = packet.get_suback_payload();
             match payload {
                 Ok(p) => {
-                    assert_eq!(p.return_codes, vec![SubAckReturnCode::MaximumQoS0, SubAckReturnCode::MaximumQoS2]);
+                    assert_eq!(
+                        p.return_codes,
+                        vec![SubAckReturnCode::MaximumQoS0, SubAckReturnCode::MaximumQoS2]
+                    );
                     assert_eq!(p.packet_id, 1);
-                },
-                _ => panic!()
+                }
+                _ => panic!(),
             }
         }
 
@@ -727,14 +781,13 @@ pub mod reader {
             let data = Bytes::from(vec![
                 0x33, 0x30, 0x00, 0x03, 0x61, 0x2F, 0x62, 0x00, 0xA, 0x48, 0x65, 0x6C, 0x6C, 0x6F
             ]);
-            let topic = data.slice(4, 7);
             let payload = data.slice_from(9);
-            let packet = read_packet(data);
+            let packet = read_packet(data).unwrap();
             assert_eq!(packet.header.packet_type, PacketType::Publish);
             match packet.var_header {
                 Publish(h) => {
                     assert_eq!(h.packet_id, 10);
-                    assert_eq!(h.topic_name, &topic);
+                    assert_eq!(h.topic_name, "a/b");
                 }
                 _ => panic!(),
             }
@@ -747,13 +800,12 @@ pub mod reader {
             let data = Bytes::from(vec![
                 0x31, 0x30, 0x00, 0x03, 0x61, 0x2F, 0x62, 0x48, 0x65, 0x6C, 0x6C, 0x6F
             ]);
-            let topic = data.slice(4, 7);
             let payload = data.slice_from(7);
-            let packet = read_packet(data);
+            let packet = read_packet(data).unwrap();
             assert_eq!(packet.header.packet_type, PacketType::Publish);
             match packet.var_header {
                 Publish(h) => {
-                    assert_eq!(h.topic_name, &topic);
+                    assert_eq!(h.topic_name, "a/b");
                 }
                 _ => panic!(),
             }
@@ -765,11 +817,11 @@ pub mod reader {
             // SUBACK, packet ID 1, payload 0x00
             let data = Bytes::from(vec![0x90, 0x03, 0x00, 0x01, 0x00]);
             let payload = data.slice_from(4);
-            let packet = read_packet(data);
+            let packet = read_packet(data).unwrap();
 
             assert_eq!(packet.header.packet_type, PacketType::SubAck);
             match packet.var_header {
-                SubAck(packet_id) => assert_eq!(packet_id, 1),
+                WithPacketId(packet_id) => assert_eq!(packet_id, 1),
                 _ => panic!(),
             }
             assert_eq!(packet.payload, &payload);
@@ -782,13 +834,13 @@ pub mod reader {
                 0xA0, 0x0F, 0x00, 0x01, 0x00, 0x0b, 0x53, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x54, 0x6f,
                 0x70, 0x69, 0x63,
             ]);
-            let packet = read_packet(data);
-            let filters = vec!["SampleTopic".to_string()]; 
+            let packet = read_packet(data).unwrap();
+            let filters = vec!["SampleTopic".to_string()];
 
             assert_eq!(packet.header.packet_type, PacketType::Unsubscribe);
             match packet.var_header.clone() {
-                Unsubscribe(id) => assert_eq!(id, 1),
-                _ => panic!()
+                WithPacketId(id) => assert_eq!(id, 1),
+                _ => panic!(),
             }
             let payload = packet.get_unsubscribe_payload();
             match payload {
@@ -796,7 +848,7 @@ pub mod reader {
                     assert_eq!(p.filters, filters);
                     assert_eq!(p.packet_id, 1);
                 }
-                Err(r) => panic!(r)
+                Err(r) => panic!(r),
             }
         }
     }
