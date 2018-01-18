@@ -14,6 +14,11 @@ use std::iter;
 use std::env;
 use std::io::{Error, ErrorKind, BufReader};
 
+use mqtt::*;
+use mqtt::reader::*;
+use mqtt_net::*;
+
+use bytes::Bytes;
 use futures::Future;
 use futures::stream::{self, Stream};
 use tokio_core::net::TcpListener;
@@ -44,39 +49,26 @@ fn start_non_secure() {
 
         let iter = stream::iter_ok::<_, Error>(iter::repeat(()));
         let socket_reader = iter.fold(reader, move |reader, _| {
-            let line = io::read_until(reader, b'\n', Vec::new());
-            let line = line.and_then(|(reader, vec)| {
+            let bytes = io::read_to_end(reader, Vec::new());
+            let bytes = bytes.and_then(|(reader, vec)| {
                 if vec.len() == 0 {
                     Err(Error::new(ErrorKind::BrokenPipe, "broken pipe"))
                 } else {
                     Ok((reader, vec))
                 }
             });
-
-            let line = line.map(|(reader, vec)| {
-                (reader, String::from_utf8(vec))
+            let bytes = bytes.map(|(reader, vec)| {
+                (reader, read_packet(Bytes::from(vec)))
             });
-            let connections = connections_inner.clone();
-            line.map(move |(reader, message)| {
-                println!("{}: {:?}", addr, message);
-                let mut conns = connections.borrow_mut();
-                if let Ok(msg) = message {
-                    let iter = conns.iter_mut()
-                                    .filter(|&(&k, _)| k != addr)
-                                    .map(|(_, v)| v);
-                    for tx in iter {
-                        tx.unbounded_send(format!("{}: {}", addr, msg)).unwrap();
-                    }
-                } else {
-                    let tx = conns.get_mut(&addr).unwrap();
-                    tx.unbounded_send("You didn't send valid UTF-8.".to_string()).unwrap();
-                }
+            bytes.map(move |(reader, packet)| {
+                // TODO
+                println!("Received {:#?}", packet);
                 reader
             })
         });
 
-        let socket_writer = rx.fold(writer, |writer, msg| {
-            let amt = io::write_all(writer, msg.into_bytes());
+        let socket_writer = rx.fold(writer, |writer, msg: &mut [u8]| {
+            let amt = io::write_all(writer, msg);
             let amt = amt.map(|(writer, _)| writer);
             amt.map_err(|_| ())
         });

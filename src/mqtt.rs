@@ -242,7 +242,7 @@ pub mod reader {
         lsb as u16 | (msb as u16) << 8
     }
 
-    fn vlq(bytes: &Bytes) -> (u32, usize) {
+    pub fn vlq(bytes: &Bytes) -> (u32, usize) {
         if bytes[0] < 128 {
             return (bytes[0] as u32, 1);
         } else if bytes[1] < 128 {
@@ -274,7 +274,6 @@ pub mod reader {
         if str_len + 2 > bytes.len() {
             return None;
         }
-        println!("{:?} - len = {}", bytes, str_len); 
         match from_utf8(&bytes.slice(2, str_len + 2)) {
             Ok(s) => Some(s.to_string()),
             Err(_) => None,
@@ -298,7 +297,7 @@ pub mod reader {
     }
 
     /* Helper functions */
-    fn read_packet_type(b: u8) -> PacketType {
+    pub fn read_packet_type(b: u8) -> PacketType {
         let value = (b & 0xF0) >> 4;
         match value {
             1 => PacketType::Connect,
@@ -319,7 +318,7 @@ pub mod reader {
         }
     }
 
-    fn validate_header_flags(ptype: &PacketType, input: u8) -> bool {
+    pub fn validate_header_flags(ptype: &PacketType, input: u8) -> bool {
         match *ptype {
             PacketType::Publish => true,
             PacketType::PubRel | PacketType::Subscribe | PacketType::Unsubscribe => input == 0x02,
@@ -369,7 +368,6 @@ pub mod reader {
                 if bytes.len() < 4 {
                     return Err("Not enough data supplied");
                 }
-                println!("{:?}", bytes);
                 if let Some(protocol_name) = utf8_safe_decode(&bytes, 0) {
                     let proto_name_len = protocol_name.len();
                     if bytes.len() < proto_name_len + 6 {
