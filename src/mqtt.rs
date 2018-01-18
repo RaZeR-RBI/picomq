@@ -1,8 +1,11 @@
+#![allow(dead_code)]
+
 extern crate bytes;
 extern crate tokio_io;
 extern crate tokio_proto;
 
 use bytes::Bytes;
+use std::fmt;
 use std::str::from_utf8;
 use std::collections::HashMap;
 
@@ -44,7 +47,7 @@ impl QoS {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub struct FixedHeader {
     pub packet_type: PacketType,
     pub dup: bool,
@@ -52,6 +55,17 @@ pub struct FixedHeader {
     pub retain: bool,
     remaining_bytes: u32,
     pub payload: Bytes,
+}
+
+impl fmt::Debug for FixedHeader {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "FixedHeader {{ \
+            type: {:?}, \
+            DUP: {}, \
+            QoS: {:?}, \
+            RETAIN: {} \
+            }}", self.packet_type, self.dup, self.qos, self.retain)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -242,7 +256,7 @@ pub mod reader {
         lsb as u16 | (msb as u16) << 8
     }
 
-    pub fn vlq(bytes: &Bytes) -> (u32, usize) {
+    fn vlq(bytes: &Bytes) -> (u32, usize) {
         if bytes[0] < 128 {
             return (bytes[0] as u32, 1);
         } else if bytes[1] < 128 {
@@ -263,7 +277,7 @@ pub mod reader {
         }
     }
 
-    fn utf8_safe_decode(bytes: &Bytes, start: usize) -> Option<String> {
+    fn utf8_safe_decode(bytes: &Bytes) -> Option<String> {
         if bytes.len() < 2 {
             return None;
         }
@@ -297,7 +311,7 @@ pub mod reader {
     }
 
     /* Helper functions */
-    pub fn read_packet_type(b: u8) -> PacketType {
+    fn read_packet_type(b: u8) -> PacketType {
         let value = (b & 0xF0) >> 4;
         match value {
             1 => PacketType::Connect,
@@ -318,7 +332,7 @@ pub mod reader {
         }
     }
 
-    pub fn validate_header_flags(ptype: &PacketType, input: u8) -> bool {
+    fn validate_header_flags(ptype: &PacketType, input: u8) -> bool {
         match *ptype {
             PacketType::Publish => true,
             PacketType::PubRel | PacketType::Subscribe | PacketType::Unsubscribe => input == 0x02,
@@ -368,7 +382,7 @@ pub mod reader {
                 if bytes.len() < 4 {
                     return Err("Not enough data supplied");
                 }
-                if let Some(protocol_name) = utf8_safe_decode(&bytes, 0) {
+                if let Some(protocol_name) = utf8_safe_decode(&bytes) {
                     let proto_name_len = protocol_name.len();
                     if bytes.len() < proto_name_len + 6 {
                         return Err("Not enough data supplied");
@@ -410,7 +424,7 @@ pub mod reader {
                 if (header.qos != QoS::AtMostOnce && bytes.len() < 6) || bytes.len() < 4 {
                     return Err("Not enough data supplied");
                 }
-                if let Some(topic) = utf8_safe_decode(&bytes, 0) {
+                if let Some(topic) = utf8_safe_decode(&bytes) {
                     let topic_len = topic.len();
                     let mut packet_id = 0u16;
                     let mut offset = topic_len + 2;

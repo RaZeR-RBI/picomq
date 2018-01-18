@@ -5,18 +5,14 @@ extern crate tokio_proto;
 extern crate bytes;
 
 mod mqtt;
-mod mqtt_net;
 
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::iter;
-use std::env;
 use std::io::{Error, ErrorKind, BufReader};
 
-use mqtt::*;
 use mqtt::reader::*;
-use mqtt_net::*;
 
 use bytes::Bytes;
 use futures::Future;
@@ -44,7 +40,6 @@ fn start_non_secure() {
         let (tx, rx) = futures::sync::mpsc::unbounded();
         connections.borrow_mut().insert(addr, tx);
 
-        let connections_inner = connections.clone();
         let reader = BufReader::new(reader);
 
         let iter = stream::iter_ok::<_, Error>(iter::repeat(()));
