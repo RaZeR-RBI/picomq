@@ -59,12 +59,19 @@ pub struct FixedHeader {
 
 impl fmt::Debug for FixedHeader {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "FixedHeader {{ \
+        write!(
+            f,
+            "FixedHeader {{ \
             type: {:?}, \
             DUP: {}, \
             QoS: {:?}, \
             RETAIN: {} \
-            }}", self.packet_type, self.dup, self.qos, self.retain)
+            }}",
+            self.packet_type,
+            self.dup,
+            self.qos,
+            self.retain
+        )
     }
 }
 
@@ -263,15 +270,15 @@ pub mod reader {
             return ((bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7), 2);
         } else if bytes[2] < 128 {
             return (
-                (bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7)
-                    | ((bytes[2] as u32 & 127) << 14),
+                (bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7) |
+                    ((bytes[2] as u32 & 127) << 14),
                 3,
             );
         } else {
             return (
-                (bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7)
-                    | ((bytes[2] as u32 & 127) << 14)
-                    | ((bytes[3] as u32 & 127) << 21),
+                (bytes[0] as u32 & 127) | ((bytes[1] as u32 & 127) << 7) |
+                    ((bytes[2] as u32 & 127) << 14) |
+                    ((bytes[3] as u32 & 127) << 21),
                 4,
             );
         }
@@ -405,20 +412,22 @@ pub mod reader {
                 Err("Invalid UTF-8 sequence in protocol name")
             }
             // CONNACK
-            PacketType::ConnAck => match bytes.len() {
-                2 => {
-                    let var_header = VariableHeader::ConnAck(ConnAckHeader {
-                        flags: bytes[0],
-                        return_code: ConnAckReturnCode::from_byte(bytes[1]),
-                    });
-                    return Ok(MqttPacket {
-                        header: header,
-                        var_header: var_header,
-                        payload: Bytes::new(),
-                    });
+            PacketType::ConnAck => {
+                match bytes.len() {
+                    2 => {
+                        let var_header = VariableHeader::ConnAck(ConnAckHeader {
+                            flags: bytes[0],
+                            return_code: ConnAckReturnCode::from_byte(bytes[1]),
+                        });
+                        return Ok(MqttPacket {
+                            header: header,
+                            var_header: var_header,
+                            payload: Bytes::new(),
+                        });
+                    }
+                    _ => Err("Invalid data supplied"),
                 }
-                _ => Err("Invalid data supplied"),
-            },
+            }
             // PUBLISH
             PacketType::Publish => {
                 if (header.qos != QoS::AtMostOnce && bytes.len() < 6) || bytes.len() < 4 {
@@ -443,14 +452,9 @@ pub mod reader {
                 }
                 Err("Invalid UTF-8 sequence")
             }
-            PacketType::PubAck
-            | PacketType::PubRec
-            | PacketType::PubRel
-            | PacketType::PubComp
-            | PacketType::Subscribe
-            | PacketType::SubAck
-            | PacketType::Unsubscribe
-            | PacketType::UnsubAck => {
+            PacketType::PubAck | PacketType::PubRec | PacketType::PubRel |
+            PacketType::PubComp | PacketType::Subscribe | PacketType::SubAck |
+            PacketType::Unsubscribe | PacketType::UnsubAck => {
                 if bytes.len() < 2 {
                     return Err("Not enough data supplied");
                 }
@@ -659,10 +663,10 @@ pub mod reader {
                 vlq(&Bytes::from(vec![0x80, 0x80, 0x80, 0x01])),
                 (2097152, 4)
             );
-            assert_eq!(
-                vlq(&Bytes::from(vec![0xFF, 0xFF, 0xFF, 0x7F])),
-                (268435455, 4)
-            );
+            assert_eq!(vlq(&Bytes::from(vec![0xFF, 0xFF, 0xFF, 0x7F])), (
+                268435455,
+                4,
+            ));
         }
 
         /* Common tests */
@@ -696,8 +700,24 @@ pub mod reader {
             // CONNECT, MsgLen = 18, protocol name = MQTT, protocol level = 4,
             // flags = 2, keep-alive: 5, client ID = "paho"
             let data = Bytes::from(vec![
-                0x10, 0x12, 0x00, 0x04, 0x4D, 0x51, 0x54, 0x54, 0x04, 0x02, 0x00, 0x05, 0x00, 0x04,
-                0x70, 0x61, 0x68, 0x6f,
+                0x10,
+                0x12,
+                0x00,
+                0x04,
+                0x4D,
+                0x51,
+                0x54,
+                0x54,
+                0x04,
+                0x02,
+                0x00,
+                0x05,
+                0x00,
+                0x04,
+                0x70,
+                0x61,
+                0x68,
+                0x6f,
             ]);
             let packet = read_packet(data).unwrap();
             assert_eq!(packet.header.packet_type, PacketType::Connect);
@@ -743,8 +763,24 @@ pub mod reader {
         fn reads_subscribe_packet() {
             // SUBSCRIBE, packet ID = 1, topic "SampleTopic", QoS = 0
             let data = Bytes::from(vec![
-                0x82, 0x10, 0x00, 0x01, 0x00, 0x0b, 0x53, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x54, 0x6f,
-                0x70, 0x69, 0x63, 0x00,
+                0x82,
+                0x10,
+                0x00,
+                0x01,
+                0x00,
+                0x0b,
+                0x53,
+                0x61,
+                0x6d,
+                0x70,
+                0x6c,
+                0x65,
+                0x54,
+                0x6f,
+                0x70,
+                0x69,
+                0x63,
+                0x00,
             ]);
             let packet = read_packet(data).unwrap();
             let mut filters = HashMap::new();
@@ -793,7 +829,20 @@ pub mod reader {
         fn reads_publish_packet_with_packet_id() {
             // PUBLISH, QoS = 1 (should have packet ID), topic: a/b, packet ID = 10, payload = Hello
             let data = Bytes::from(vec![
-                0x33, 0x30, 0x00, 0x03, 0x61, 0x2F, 0x62, 0x00, 0xA, 0x48, 0x65, 0x6C, 0x6C, 0x6F
+                0x33,
+                0x30,
+                0x00,
+                0x03,
+                0x61,
+                0x2F,
+                0x62,
+                0x00,
+                0xA,
+                0x48,
+                0x65,
+                0x6C,
+                0x6C,
+                0x6F,
             ]);
             let payload = data.slice_from(9);
             let packet = read_packet(data).unwrap();
@@ -812,7 +861,18 @@ pub mod reader {
         fn reads_publish_packet_without_packet_id() {
             // PUBLISH, QoS = 0 (shouldn't have packet ID), topic: a/b, payload = Hello
             let data = Bytes::from(vec![
-                0x31, 0x30, 0x00, 0x03, 0x61, 0x2F, 0x62, 0x48, 0x65, 0x6C, 0x6C, 0x6F
+                0x31,
+                0x30,
+                0x00,
+                0x03,
+                0x61,
+                0x2F,
+                0x62,
+                0x48,
+                0x65,
+                0x6C,
+                0x6C,
+                0x6F,
             ]);
             let payload = data.slice_from(7);
             let packet = read_packet(data).unwrap();
@@ -845,8 +905,23 @@ pub mod reader {
         fn reads_unsubscribe_packet() {
             // UNSUBSCRIBE, packet ID = 1, topic "SampleTopic"
             let data = Bytes::from(vec![
-                0xA2, 0x0F, 0x00, 0x01, 0x00, 0x0b, 0x53, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x54, 0x6f,
-                0x70, 0x69, 0x63,
+                0xA2,
+                0x0F,
+                0x00,
+                0x01,
+                0x00,
+                0x0b,
+                0x53,
+                0x61,
+                0x6d,
+                0x70,
+                0x6c,
+                0x65,
+                0x54,
+                0x6f,
+                0x70,
+                0x69,
+                0x63,
             ]);
             let packet = read_packet(data).unwrap();
             let filters = vec!["SampleTopic".to_string()];
