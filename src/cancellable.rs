@@ -10,10 +10,12 @@ where
     cancel: bool,
 }
 
-impl CancellableIoFuture<S>
+impl<S> CancellableIoFuture<S>
+where
+    S: Future<Error=Error>,
 {
-    pub fn request_cancellation(&self) {
-        &self.cancel = true;
+    pub fn request_cancellation(&mut self) {
+        self.cancel = true;
     }
 }
 
